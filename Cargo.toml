@@ -1,0 +1,10 @@
+[package]
+name = "blake-db"
+version = "0.1.0"
+authors = ["David Craven <david@craven.ch>"]
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0.41"
+blake-streams = { path = "../streams" }
+sled = "0.34.6"
