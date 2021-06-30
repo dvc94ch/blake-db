@@ -29,6 +29,8 @@ struct StreamState {
     index: u64,
     streams: Vec<StreamId>,
     seq: u64,
+    ops: u64,
+    sync_offset: u64,
     offset: u64,
     queue: VecDeque<StreamEvent>,
     dependents: VecDeque<StreamId>,
@@ -40,6 +42,8 @@ impl StreamState {
             index,
             streams: Default::default(),
             seq: 0,
+            ops: 0,
+            sync_offset: 0,
             offset: 0,
             queue: Default::default(),
             dependents: Default::default(),
@@ -55,10 +59,10 @@ pub struct State {
 }
 
 impl State {
-    pub fn apply_event(&mut self, id: &StreamId, ev: StreamEvent) -> Result<()> {
+    pub fn apply_event(&mut self, id: &StreamId, ev: StreamEvent, skip_queue: bool) -> Result<()> {
         tracing::info!("{} {:?}", id, ev);
         let entry = self.streams.get_mut(id).unwrap();
-        if !entry.queue.is_empty() {
+        if !entry.queue.is_empty() && !skip_queue {
             entry.queue.push_back(ev);
             return Ok(());
         }
@@ -70,21 +74,25 @@ impl State {
             }
             StreamOp::Depend(idx, offset) => {
                 if let Some(dep_id) = entry.streams.get_mut(idx as usize) {
-                    let dep = self.streams.get_mut(dep_id).unwrap();
-                    if offset > dep.offset {
-                        debug_assert!(entry.queue.is_empty());
-                        entry.queue.push_back(ev);
-                        dep.dependents.push_back(*id);
+                    tracing::info!("dep {}", dep_id);
+                    // Is None if the dep_id == self
+                    if let Some(dep) = self.streams.get_mut(dep_id) {
+                        if offset > dep.offset {
+                            debug_assert!(entry.queue.is_empty());
+                            entry.queue.push_back(ev);
+                            dep.dependents.push_back(*id);
+                        }
                     }
                 }
             }
             StreamOp::Change(ops) => {
                 let seq = entry.seq;
                 entry.seq += 1;
+                entry.ops += ops.len() as u64;
                 let change = Change {
                     actor_id: ActorId::from_bytes(id.as_bytes()),
                     seq,
-                    start_op: seq,
+                    start_op: entry.ops,
                     time: 0,
                     message: None,
                     hash: None,
@@ -96,17 +104,15 @@ impl State {
                 self.frontend.apply_patch(patch)?;
             }
         };
-        loop {
-            if let Some(id) = entry.dependents.pop_front() {
-                let rdep = self.streams.get_mut(&id).unwrap();
-                let event = rdep.queue.pop_front().unwrap();
-                if event.offset > entry.offset {
-                    entry.dependents.push_front(id);
-                    rdep.queue.push_front(event);
-                    break;
-                }
-                self.apply_event(&id, event)?;
+        while let Some(id) = entry.dependents.pop_front() {
+            let rdep = self.streams.get_mut(&id).unwrap();
+            let event = rdep.queue.pop_front().unwrap();
+            if event.offset > entry.offset {
+                entry.dependents.push_front(id);
+                rdep.queue.push_front(event);
+                break;
             }
+            self.apply_event(&id, event, true)?;
         }
         self.streams.insert(*id, entry);
         Ok(())
@@ -145,18 +151,21 @@ impl BlakeDb {
         let bytes = serde_cbor::to_vec(&op)?;
         self.write.write_u64::<BigEndian>(bytes.len() as u64)?;
         self.write.write_all(&bytes)?;
+        tracing::info!("writing {} bytes", bytes.len() + 8);
         Ok(())
     }
 
     async fn commit(&mut self) -> Result<()> {
         tracing::info!("commit");
+        self.write.flush()?;
         self.write.get_mut().commit().await
     }
 
     pub async fn link(&mut self, id: &StreamId) -> Result<()> {
-        if self.state.streams.contains_key(id) {
+        if self.state.streams.contains_key(id) || *id == self.stream_id() {
             return Ok(());
         }
+        tracing::info!("linking {}", id);
         let idx = self.state.streams.len() as u64;
         self.write_op(&StreamOp::Link(*id))?;
         self.commit().await?;
@@ -193,31 +202,37 @@ impl BlakeDb {
         tracing::info!("next");
         let mut buf = vec![];
         if let Some(head) = self.read.next().await {
+            tracing::info!("got head");
             let id = head.id;
             let start = self
                 .state
                 .streams
                 .get(&id)
-                .map(|stream| stream.offset)
+                .map(|stream| stream.sync_offset)
                 .unwrap_or_default();
             let len = head.len - start;
             let mut reader = self.streams.slice(&id, start, len)?;
             let mut pos = 0;
+            tracing::info!("start {} len {} offset {}", start, len, head.len);
             while pos < len {
                 let len = reader.read_u64::<BigEndian>()?;
-                let offset = pos + len;
                 buf.clear();
+                tracing::info!("len {}", len);
                 buf.reserve(len as usize);
-                unsafe { buf.set_len(len as usize) };
+                buf.resize(len as usize, 0);
                 reader.read_exact(&mut buf)?;
                 let op: StreamOp = serde_cbor::from_slice(&buf)?;
                 if let StreamOp::Link(id) = &op {
                     self.link(id).await?;
                 }
-                let event = StreamEvent { op, offset };
-                self.state.apply_event(&id, event)?;
-                pos = offset;
+                pos += 8 + len;
+                let event = StreamEvent {
+                    op,
+                    offset: start + pos,
+                };
+                self.state.apply_event(&id, event, false)?;
             }
+            self.state.streams.get_mut(&id).unwrap().sync_offset = head.len;
         }
         Ok(())
     }
@@ -276,7 +291,7 @@ mod tests {
         doc1.next().await?;
         doc2.next().await?;
 
-        // Initial state
+        tracing::info!("Initial state");
         doc1.change(|doc| {
             doc.add_change(LocalChange::set(
                 Path::root(),
@@ -286,7 +301,16 @@ mod tests {
         .await?;
         doc2.next().await?;
 
-        // Add card
+        tracing::info!(
+            "{}",
+            serde_json::to_string(&doc1.state().to_json()).unwrap()
+        );
+        tracing::info!(
+            "{}",
+            serde_json::to_string(&doc2.state().to_json()).unwrap()
+        );
+
+        tracing::info!("Add card");
         doc1.change(|doc| {
             doc.add_change(LocalChange::insert(
                 Path::root().key("cards").index(0),
@@ -298,7 +322,16 @@ mod tests {
         .await?;
         doc2.next().await?;
 
-        // Add another card
+        tracing::info!(
+            "{}",
+            serde_json::to_string(&doc1.state().to_json()).unwrap()
+        );
+        tracing::info!(
+            "{}",
+            serde_json::to_string(&doc2.state().to_json()).unwrap()
+        );
+
+        tracing::info!("Add another card");
         doc1.change(|doc| {
             doc.add_change(LocalChange::insert(
                 Path::root().key("cards").index(0),
@@ -310,7 +343,7 @@ mod tests {
         .await?;
         doc2.next().await?;
 
-        // Mark card as done
+        tracing::info!("Mark card as done");
         doc1.change(|doc| {
             doc.add_change(LocalChange::set(
                 Path::root().key("cards").index(0).key("done"),
@@ -319,7 +352,7 @@ mod tests {
         })
         .await?;
 
-        // Delete card.
+        tracing::info!("Delete card");
         doc2.change(|doc| doc.add_change(LocalChange::delete(Path::root().key("cards").index(1))))
             .await?;
 
@@ -327,15 +360,14 @@ mod tests {
         doc2.next().await?;
 
         // TODO wait for convergence
-        println!(
+        tracing::info!(
             "{}",
             serde_json::to_string(&doc1.state().to_json()).unwrap()
         );
-        println!(
+        tracing::info!(
             "{}",
             serde_json::to_string(&doc2.state().to_json()).unwrap()
         );
-        assert!(false);
 
         Ok(())
     }
