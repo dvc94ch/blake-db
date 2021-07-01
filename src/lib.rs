@@ -41,8 +41,8 @@ impl StreamState {
         Self {
             index,
             streams: Default::default(),
-            seq: 0,
-            ops: 0,
+            seq: 1,
+            ops: 1,
             sync_offset: 0,
             offset: 0,
             queue: Default::default(),
@@ -51,14 +51,23 @@ impl StreamState {
     }
 }
 
-#[derive(Default)]
 pub struct State {
+    id: StreamId,
     streams: FnvHashMap<StreamId, StreamState>,
     backend: Backend,
     frontend: Frontend,
 }
 
 impl State {
+    pub fn new(id: StreamId) -> Self {
+        Self {
+            id,
+            streams: Default::default(),
+            backend: Backend::new(),
+            frontend: Frontend::new_with_timestamper_and_actor_id(Box::new(|| None), id.as_bytes()),
+        }
+    }
+
     pub fn apply_event(&mut self, id: &StreamId, ev: StreamEvent, skip_queue: bool) -> Result<()> {
         tracing::info!("{} {:?}", id, ev);
         let entry = self.streams.get_mut(id).unwrap();
@@ -86,12 +95,9 @@ impl State {
                 }
             }
             StreamOp::Change(ops) => {
-                let seq = entry.seq;
-                entry.seq += 1;
-                entry.ops += ops.len() as u64;
                 let change = Change {
                     actor_id: ActorId::from_bytes(id.as_bytes()),
-                    seq,
+                    seq: entry.seq,
                     start_op: entry.ops,
                     time: 0,
                     message: None,
@@ -100,6 +106,8 @@ impl State {
                     operations: ops,
                     extra_bytes: vec![],
                 };
+                entry.seq += 1;
+                entry.ops += change.operations.len() as u64;
                 let patch = self.backend.apply_changes(vec![change.into()])?;
                 self.frontend.apply_patch(patch)?;
             }
@@ -128,19 +136,20 @@ pub struct BlakeDb {
 
 impl BlakeDb {
     pub async fn new(streams: BlakeStreams) -> Result<Self> {
+        let key = streams.ipfs().local_public_key();
+        let id = StreamId::new(key.to_bytes(), 0);
         let mut write = streams.append(0).await?;
         write.commit().await?;
         Ok(Self {
-            state: Default::default(),
+            state: State::new(id),
             streams,
             write: BufWriter::new(write),
             read: StreamsUnordered::new(),
         })
     }
 
-    pub fn stream_id(&self) -> StreamId {
-        let key = self.streams.ipfs().local_public_key();
-        StreamId::new(key.to_bytes(), 0)
+    pub fn stream_id(&self) -> &StreamId {
+        &self.state.id
     }
 
     pub fn ipfs(&self) -> &Ipfs {
@@ -162,7 +171,7 @@ impl BlakeDb {
     }
 
     pub async fn link(&mut self, id: &StreamId) -> Result<()> {
-        if self.state.streams.contains_key(id) || *id == self.stream_id() {
+        if self.state.streams.contains_key(id) || id == self.stream_id() {
             return Ok(());
         }
         tracing::info!("linking {}", id);
@@ -299,12 +308,11 @@ mod tests {
             ))
         })
         .await?;
-        doc2.next().await?;
-
         tracing::info!(
             "{}",
             serde_json::to_string(&doc1.state().to_json()).unwrap()
         );
+        doc2.next().await?;
         tracing::info!(
             "{}",
             serde_json::to_string(&doc2.state().to_json()).unwrap()
@@ -320,12 +328,11 @@ mod tests {
             ))
         })
         .await?;
-        doc2.next().await?;
-
         tracing::info!(
             "{}",
             serde_json::to_string(&doc1.state().to_json()).unwrap()
         );
+        doc2.next().await?;
         tracing::info!(
             "{}",
             serde_json::to_string(&doc2.state().to_json()).unwrap()
