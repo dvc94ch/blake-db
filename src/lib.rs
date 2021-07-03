@@ -1,10 +1,10 @@
 use anyhow::Result;
-use automerge::{Backend, Frontend, InvalidChangeRequest, MutableDocument, Value};
-use automerge_protocol::{ActorId, Change, Op, Patch};
-use blake_streams::{BlakeStreams, Head, Ipfs, StreamId, StreamWriter};
+use automerge::{Backend, Frontend, InvalidChangeRequest, MutableDocument};
+use automerge_protocol::{ActorId, Change, Op};
+use blake_streams::{BlakeStreams, Head, StreamWriter};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use fnv::FnvHashMap;
-use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use async_channel::{Receiver, Sender};
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -12,6 +12,10 @@ use std::io::{BufWriter, Read, Write};
 use std::pin::Pin;
 use unicycle::StreamsUnordered;
 use zerocopy::AsBytes;
+
+pub use automerge::{LocalChange, Path, Primitive, Value};
+pub use automerge_protocol::Patch;
+pub use blake_streams::{ipfs_embed, Ipfs, StreamId};
 
 /// A blake stream contains stream ops.
 #[derive(Debug, Deserialize, Serialize)]
@@ -54,6 +58,7 @@ struct StreamEvent {
 }
 
 /// State of a stream.
+#[derive(Debug)]
 struct StreamState {
     /// Document id.
     doc: u64,
@@ -90,6 +95,7 @@ impl StreamState {
 
 /// Frontend initiated operations that are performed
 /// on a document.
+#[derive(Debug)]
 enum DocOp {
     /// Make a change to the document.
     Change(u64, Change),
@@ -100,7 +106,7 @@ enum DocOp {
 /// State of a document.
 struct DocumentState {
     /// Send patches to the frontend.
-    tx: UnboundedSender<Patch>,
+    tx: Sender<Patch>,
     /// Stream writer to write stream ops to.
     write: BufWriter<StreamWriter>,
     /// Document backend.
@@ -110,7 +116,7 @@ struct DocumentState {
 }
 
 impl DocumentState {
-    pub fn new(tx: UnboundedSender<Patch>, write: StreamWriter) -> Self {
+    pub fn new(tx: Sender<Patch>, write: StreamWriter) -> Self {
         Self {
             tx,
             write: BufWriter::new(write),
@@ -121,19 +127,20 @@ impl DocumentState {
 }
 
 /// Document handle.
+#[derive(Debug)]
 pub struct Document {
     /// Local stream id.
     id: StreamId,
     /// State of the document.
     frontend: Frontend,
     /// Send document operations to the backend.
-    tx: UnboundedSender<DocOp>,
+    tx: Sender<DocOp>,
     /// Receive patches from the backend.
-    rx: UnboundedReceiver<Patch>,
+    rx: Receiver<Patch>,
 }
 
 impl Document {
-    fn new(id: StreamId, tx: UnboundedSender<DocOp>, rx: UnboundedReceiver<Patch>) -> Self {
+    fn new(id: StreamId, tx: Sender<DocOp>, rx: Receiver<Patch>) -> Self {
         Self {
             id,
             frontend: Frontend::new_with_timestamper_and_actor_id(Box::new(|| None), id.as_bytes()),
@@ -147,7 +154,7 @@ impl Document {
     }
 
     pub fn link(&mut self, id: &StreamId) -> Result<()> {
-        self.tx.unbounded_send(DocOp::Link(self.id.stream(), *id))?;
+        self.tx.try_send(DocOp::Link(self.id.stream(), *id))?;
         Ok(())
     }
 
@@ -157,8 +164,7 @@ impl Document {
     {
         let (output, change) = self.frontend.change(None, cb)?;
         if let Some(change) = change {
-            self.tx
-                .unbounded_send(DocOp::Change(self.id.stream(), change))?;
+            self.tx.try_send(DocOp::Change(self.id.stream(), change))?;
         }
         Ok(output)
     }
@@ -167,10 +173,12 @@ impl Document {
         self.frontend.state()
     }
 
-    pub async fn next(&mut self) -> Result<()> {
-        if let Some(patch) = self.rx.next().await {
-            self.frontend.apply_patch(patch)?;
-        }
+    pub fn patches(&self) -> Receiver<Patch> {
+        self.rx.clone()
+    }
+
+    pub fn apply_patch(&mut self, patch: Patch) -> Result<()> {
+        self.frontend.apply_patch(patch)?;
         Ok(())
     }
 }
@@ -181,16 +189,16 @@ pub struct BlakeDb {
     docs: FnvHashMap<u64, DocumentState>,
     heads: StreamsUnordered<Pin<Box<dyn Stream<Item = Head> + Send + 'static>>>,
     buf: Vec<u8>,
-    tx: UnboundedSender<DocOp>,
+    tx: Sender<DocOp>,
     /// Receive commands from the frontends.
-    rx: UnboundedReceiver<DocOp>,
+    rx: Receiver<DocOp>,
 }
 
 impl BlakeDb {
-    pub fn new(inner: BlakeStreams) -> Self {
-        let (tx, rx) = mpsc::unbounded();
+    pub fn new(inner: Ipfs) -> Self {
+        let (tx, rx) = async_channel::unbounded();
         Self {
-            inner,
+            inner: BlakeStreams::new(inner),
             streams: Default::default(),
             docs: Default::default(),
             heads: StreamsUnordered::new(),
@@ -210,7 +218,7 @@ impl BlakeDb {
             write.commit().await?;
         }
         let id = *write.id();
-        let (patch_tx, patch_rx) = mpsc::unbounded();
+        let (patch_tx, patch_rx) = async_channel::unbounded();
         let doc = DocumentState::new(patch_tx, write);
         self.docs.insert(id.stream(), doc);
         Ok(Document::new(id, self.tx.clone(), patch_rx))
@@ -240,7 +248,7 @@ impl BlakeDb {
         let ops = change.operations.clone();
         let doc = self.docs.get_mut(&id).unwrap();
         let (patch, _change) = doc.backend.apply_local_change(change)?;
-        doc.tx.unbounded_send(patch)?;
+        doc.tx.try_send(patch)?;
         let mut deps = vec![];
         for (id, index) in &doc.streams {
             let stream = self.streams.get(id).unwrap();
@@ -341,7 +349,7 @@ impl BlakeDb {
                 entry.ops += change.operations.len() as u64;
                 let doc = self.docs.get_mut(&entry.doc).unwrap();
                 let patch = doc.backend.apply_changes(vec![change.into()])?;
-                doc.tx.unbounded_send(patch)?;
+                doc.tx.try_send(patch)?;
             }
         };
         while let Some(id) = entry.dependents.pop_front() {
@@ -362,8 +370,6 @@ impl BlakeDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use automerge::{LocalChange, Path, Primitive, Value};
-    use ipfs_embed::{generate_keypair, Config};
     use serde_json::json;
     use std::path::PathBuf;
     use tempdir::TempDir;

@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0.41"
+async-channel = "1.6.1"
 automerge = { path = "../automerge-rs/automerge" }
 automerge-protocol = { path = "../automerge-rs/automerge-protocol" }
 blake-streams = { path = "../streams" }
