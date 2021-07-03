@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "demo"]
+
 [package]
 name = "blake-db"
 version = "0.1.0"
