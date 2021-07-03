@@ -1,13 +1,14 @@
 use anyhow::Result;
 use blake_db::{
-    ipfs_embed::{Keypair, PublicKey, SecretKey},
-    Patch,
+    ipfs_embed::{Config, Keypair, PublicKey, SecretKey, ToLibp2p},
+    Ipfs, Patch, StreamId,
 };
 use blake_db_demo::{
     db::Db,
     style,
     task::{Task, TaskMessage},
 };
+use futures::prelude::*;
 use iced::{
     button, scrollable, text_input, Align, Application, Button, Clipboard, Column, Command,
     Container, Element, HorizontalAlignment, Length, Row, Scrollable, Settings, Subscription, Text,
@@ -15,15 +16,36 @@ use iced::{
 };
 use std::path::Path;
 
+fn gen_keypair(i: u8) -> Keypair {
+    let secret = SecretKey::from_bytes(&[i; 32]).unwrap();
+    let public = PublicKey::from(&secret);
+    Keypair { secret, public }
+}
+
 #[async_std::main]
 pub async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let i: u8 = std::env::args().nth(1).unwrap().parse()?;
     let path = Path::new("/tmp").join(i.to_string());
-    let secret = SecretKey::from_bytes(&[i; 32])?;
-    let public = PublicKey::from(&secret);
-    let keypair = Keypair { secret, public };
-    let db = Db::new(path, keypair, &[]).await?;
-    Todos::run(Settings::with_flags(db))?;
+    let keypair = gen_keypair(i);
+    let addr = "/ip4/0.0.0.0/tcp/8001".parse()?;
+    if i == 0 {
+        let config = Config::new(&path, keypair);
+        let ipfs = Ipfs::new(config).await?;
+        ipfs.listen_on(addr)?.next().await;
+        loop {
+            async_std::task::sleep(std::time::Duration::from_secs(1)).await
+        }
+    } else {
+        let bootstrap = vec![(gen_keypair(0).to_public().into_peer_id(), addr)];
+        let mut db = Db::new(path, keypair, &bootstrap).await?;
+        let peer = if i == 1 { 2 } else { 1 };
+        let id = StreamId::new(gen_keypair(peer).public.to_bytes(), 0);
+        db.link(&id)?;
+        Todos::run(Settings::with_flags(db))?;
+    }
     Ok(())
 }
 

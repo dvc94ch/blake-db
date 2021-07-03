@@ -33,19 +33,20 @@ impl Db {
         keypair: Keypair,
         bootstrap: &[(PeerId, Multiaddr)],
     ) -> Result<Self> {
-        std::fs::create_dir_all(&path)?;
         let config = Config::new(&path, keypair);
         let ipfs = Ipfs::new(config).await?;
         ipfs.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?.next().await;
         ipfs.bootstrap(bootstrap).await?;
         let mut db = BlakeDb::new(ipfs);
         let mut doc = db.document(0).await?;
-        doc.change(|doc| {
-            doc.add_change(LocalChange::set(
-                Path::root(),
-                Value::from_json(&json!({ "todos": [] })),
-            ))
-        })?;
+        if doc.state().get_value(Path::root().key("todos")).is_none() {
+            doc.change(|doc| {
+                doc.add_change(LocalChange::set(
+                    Path::root(),
+                    Value::from_json(&json!({ "todos": [] })),
+                ))
+            })?;
+        }
         async_std::task::spawn(async move {
             loop {
                 if let Err(err) = db.next().await {
@@ -71,8 +72,8 @@ impl Db {
         };
         todos.reserve(seq.len());
         for val in seq {
+            let mut todo = Todo::default();
             if let Value::Map(map) = val {
-                let mut todo = Todo::default();
                 if let Some(Value::Primitive(Primitive::Str(title))) = map.get("title") {
                     todo.title = title.to_string();
                 }
@@ -80,6 +81,7 @@ impl Db {
                     todo.done = *done;
                 }
             }
+            todos.push(todo);
         }
         todos
     }
