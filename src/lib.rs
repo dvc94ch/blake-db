@@ -259,13 +259,15 @@ impl BlakeDb {
         if link && stream.peer() == self.inner.ipfs().local_public_key() {
             return Ok(());
         }
-        let doc = self.docs.get_mut(&id).unwrap();
-        if doc.streams.contains_key(stream) {
+        if self.streams.contains_key(stream) {
             return Ok(());
         }
         tracing::info!("doc {}: linking {}", id, stream);
-        let index = doc.streams.len() as u64;
-        doc.streams.insert(*stream, index);
+        let doc = self.docs.get_mut(&id).unwrap();
+        if stream.peer() != self.inner.ipfs().local_public_key() {
+            let index = doc.streams.len() as u64;
+            doc.streams.insert(*stream, index);
+        }
         self.streams.insert(*stream, StreamState::new(id));
         if link {
             StreamOp::Link(*stream).write_to(&mut doc.write)?;
@@ -279,13 +281,13 @@ impl BlakeDb {
     }
 
     async fn change(&mut self, id: u64, change: Change) -> Result<()> {
+        tracing::debug!("doc: {} local_change: {:?}", id, change);
         let ops = change.operations.clone();
         let doc = self.docs.get_mut(&id).unwrap();
         let (patch, _change) = doc.backend.apply_local_change(change)?;
         doc.tx.try_send(patch)?;
         let mut deps = vec![];
         for (id, index) in &doc.streams {
-            let stream = self.streams.get(id).unwrap();
             // TODO only write changed offsets.
             deps.push(StreamOp::Depend(*index, stream.offset));
         }
@@ -360,7 +362,6 @@ impl BlakeDb {
             return Ok(());
         }
         let mut entry = self.streams.remove(&id).unwrap();
-        entry.offset = ev.offset;
         match ev.op {
             StreamOp::Link(id) => {
                 entry.streams.push(id);
@@ -369,7 +370,7 @@ impl BlakeDb {
                 if let Some(dep_id) = entry.streams.get_mut(idx as usize) {
                     // Is None if the dep_id == self
                     if let Some(dep) = self.streams.get_mut(dep_id) {
-                        if offset < dep.offset {
+                        if offset > dep.offset {
                             tracing::error!("{} depends on {} {}", id, dep_id, offset);
                             debug_assert!(entry.queue.is_empty());
                             entry.queue.push_back(ev);
@@ -394,20 +395,23 @@ impl BlakeDb {
                 tracing::debug!("{:?}", change);
                 entry.seq += 1;
                 entry.ops += change.operations.len() as u64;
+                entry.offset = ev.offset;
                 let doc = self.docs.get_mut(&entry.doc).unwrap();
                 let patch = doc.backend.apply_changes(vec![change.into()])?;
                 doc.tx.try_send(patch)?;
             }
         };
         while let Some(id) = entry.dependents.pop_front() {
+            tracing::info!("popping dependent {}", id);
             let rdep = self.streams.get_mut(&id).unwrap();
             if let Some(event) = rdep.queue.pop_front() {
-                if event.offset > entry.offset {
-                    tracing::error!("blocked by {} > {}", event.offset, entry.offset);
+                if event.offset < entry.offset {
+                    tracing::error!("blocked by {} < {}", event.offset, entry.offset);
                     entry.dependents.push_front(id);
                     rdep.queue.push_front(event);
                     break;
                 }
+                tracing::info!("reapplying event {} {}", id, event.offset);
                 self.apply_event(&id, event, true)?;
             }
         }
