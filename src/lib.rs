@@ -50,11 +50,10 @@ impl StreamOp {
 
 /// Queued stream event.
 #[derive(Debug)]
-struct StreamEvent {
-    /// The parsed stream op.
-    op: StreamOp,
-    /// The offset of the op.
-    offset: u64,
+enum QueueOp {
+    Link(u64),
+    Depend(u64, StreamId, u64),
+    Change(u64, Vec<Op>),
 }
 
 /// State of a stream.
@@ -66,14 +65,12 @@ struct StreamState {
     streams: Vec<StreamId>,
     /// The next sequence number.
     seq: u64,
-    /// The next op number.
-    ops: u64,
     /// The offset that was synced.
     sync_offset: u64,
     /// The offset that was processed.
     offset: u64,
     /// Queue of unprocessed events.
-    queue: VecDeque<StreamEvent>,
+    queue: VecDeque<QueueOp>,
     /// Queue of streams blocked by this stream.
     dependents: VecDeque<StreamId>,
 }
@@ -84,7 +81,6 @@ impl StreamState {
             doc,
             streams: Default::default(),
             seq: 1,
-            ops: 1,
             sync_offset: 0,
             offset: 0,
             queue: Default::default(),
@@ -113,6 +109,8 @@ struct DocumentState {
     backend: Backend,
     /// Streams that are linked to this document.
     streams: FnvHashMap<StreamId, u64>,
+    /// The next op number.
+    ops: u64,
 }
 
 impl DocumentState {
@@ -122,6 +120,7 @@ impl DocumentState {
             write: BufWriter::new(write),
             backend: Backend::new(),
             streams: Default::default(),
+            ops: 1,
         }
     }
 
@@ -238,13 +237,11 @@ impl BlakeDb {
         if head.len() != 0 {
             self.streams
                 .insert(*head.id(), StreamState::new(head.id().stream()));
-            self.apply_events(id, *head.id(), 0, head.len(), false)
-                .await?;
+            self.apply_events(id, *head.id(), 0, head.len())?;
             let links = self.streams.get(head.id()).unwrap().streams.clone();
             for link in links {
                 if let Some(head) = self.inner.head(&link)? {
-                    self.apply_events(id, *head.id(), 0, head.len(), false)
-                        .await?;
+                    self.apply_events(id, *head.id(), 0, head.len())?;
                 }
             }
             let stream = self.streams.remove(head.id()).unwrap();
@@ -255,8 +252,8 @@ impl BlakeDb {
         Ok(doc)
     }
 
-    async fn link(&mut self, id: u64, stream: &StreamId, link: bool) -> Result<()> {
-        if link && stream.peer() == self.inner.ipfs().local_public_key() {
+    async fn link(&mut self, id: u64, stream: &StreamId) -> Result<()> {
+        if stream.peer() == self.inner.ipfs().local_public_key() {
             return Ok(());
         }
         if self.streams.contains_key(stream) {
@@ -264,19 +261,13 @@ impl BlakeDb {
         }
         tracing::info!("doc {}: linking {}", id, stream);
         let doc = self.docs.get_mut(&id).unwrap();
-        if stream.peer() != self.inner.ipfs().local_public_key() {
-            let index = doc.streams.len() as u64;
-            doc.streams.insert(*stream, index);
-        }
+        let index = doc.streams.len() as u64;
+        doc.streams.insert(*stream, index);
         self.streams.insert(*stream, StreamState::new(id));
-        if link {
-            StreamOp::Link(*stream).write_to(&mut doc.write)?;
-            doc.commit().await?;
-        }
-        if stream.peer() != self.inner.ipfs().local_public_key() {
-            let subscription = self.inner.subscribe(stream).await?;
-            self.heads.push(Box::pin(subscription));
-        }
+        StreamOp::Link(*stream).write_to(&mut doc.write)?;
+        doc.commit().await?;
+        let subscription = self.inner.subscribe(stream).await?;
+        self.heads.push(Box::pin(subscription));
         Ok(())
     }
 
@@ -288,12 +279,17 @@ impl BlakeDb {
         doc.tx.try_send(patch)?;
         let mut deps = vec![];
         for (id, index) in &doc.streams {
-            // TODO only write changed offsets.
-            deps.push(StreamOp::Depend(*index, stream.offset));
+            if let Some(stream) = self.streams.get(id) {
+                // TODO only write changed offsets.
+                deps.push(StreamOp::Depend(*index, stream.offset));
+            } else {
+                tracing::error!("missing stream {}", id);
+            }
         }
         for dep in &deps {
             dep.write_to(&mut doc.write)?;
         }
+        doc.ops += ops.len() as u64;
         StreamOp::Change(ops).write_to(&mut doc.write)?;
         doc.commit().await?;
         Ok(())
@@ -308,7 +304,7 @@ impl BlakeDb {
             }
             cmd = self.rx.next().fuse() => {
                 match cmd {
-                    Some(DocOp::Link(id, stream)) => self.link(id, &stream, true).await?,
+                    Some(DocOp::Link(id, stream)) => self.link(id, &stream).await?,
                     Some(DocOp::Change(id, change)) => self.change(id, change).await?,
                     None => {}
                 }
@@ -324,67 +320,93 @@ impl BlakeDb {
         let start = stream.sync_offset;
         let len = head.len - start;
         tracing::info!("start {} len {} offset {}", start, len, head.len);
-        self.apply_events(doc, id, start, len, true).await?;
+        self.apply_events(doc, id, start, len)?;
         self.streams.get_mut(&id).unwrap().sync_offset = head.len;
         Ok(())
     }
 
-    async fn apply_events(
-        &mut self,
-        doc: u64,
-        id: StreamId,
-        start: u64,
-        len: u64,
-        link: bool,
-    ) -> Result<()> {
+    fn apply_events(&mut self, doc: u64, id: StreamId, start: u64, len: u64) -> Result<()> {
         let mut reader = self.inner.slice(&id, start, len)?;
         let mut pos = 0;
         while pos < len {
             let op = StreamOp::read_one(&mut reader, &mut self.buf)?;
-            if let StreamOp::Link(id) = &op {
-                self.link(doc, id, link).await?;
-            }
             pos += self.buf.len() as u64 + 8;
-            let event = StreamEvent {
-                op,
-                offset: start + pos,
-            };
-            self.apply_event(&id, event, false)?;
+            self.apply_op(doc, id, op, start + pos)?;
         }
         Ok(())
     }
 
-    fn apply_event(&mut self, id: &StreamId, ev: StreamEvent, skip_queue: bool) -> Result<()> {
-        let entry = self.streams.get_mut(id).unwrap();
-        if !entry.queue.is_empty() && !skip_queue {
-            tracing::info!("queuing {} {}", id, ev.offset);
-            entry.queue.push_back(ev);
-            return Ok(());
-        }
-        let mut entry = self.streams.remove(&id).unwrap();
-        match ev.op {
-            StreamOp::Link(id) => {
-                entry.streams.push(id);
-            }
-            StreamOp::Depend(idx, offset) => {
-                if let Some(dep_id) = entry.streams.get_mut(idx as usize) {
-                    // Is None if the dep_id == self
-                    if let Some(dep) = self.streams.get_mut(dep_id) {
-                        if offset > dep.offset {
-                            tracing::error!("{} depends on {} {}", id, dep_id, offset);
-                            debug_assert!(entry.queue.is_empty());
-                            entry.queue.push_back(ev);
-                            dep.dependents.push_back(*id);
-                        }
-                    }
+    fn apply_op(&mut self, doc: u64, id: StreamId, op: StreamOp, offset: u64) -> Result<()> {
+        self.queue_op(&id, op, offset);
+        let streams = self.docs.get(&doc).unwrap().streams.clone();
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for (id, _) in &streams {
+                while self.dequeue_op(id)? {
+                    progress = true;
                 }
             }
+            if !progress {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_op(&mut self, id: &StreamId, op: StreamOp, offset: u64) {
+        let entry = self.streams.get_mut(&id).unwrap();
+        match op {
+            StreamOp::Link(dep) => {
+                entry.streams.push(dep);
+                tracing::info!(
+                    "linking {} to {} with index {}",
+                    id,
+                    dep,
+                    entry.streams.len()
+                );
+                entry.queue.push_back(QueueOp::Link(offset));
+            }
+            StreamOp::Depend(dep_idx, dep_offset) => {
+                let dep_id = *entry.streams.get(dep_idx as usize).unwrap();
+                entry
+                    .queue
+                    .push_back(QueueOp::Depend(offset, dep_id, dep_offset));
+            }
             StreamOp::Change(ops) => {
-                tracing::info!("applying change {} {}", id, ev.offset);
+                entry.queue.push_back(QueueOp::Change(offset, ops));
+            }
+        }
+    }
+
+    fn dequeue_op(&mut self, id: &StreamId) -> Result<bool> {
+        let entry = self.streams.get_mut(id).unwrap();
+        match entry.queue.pop_front() {
+            Some(QueueOp::Link(offset)) => {
+                entry.offset = offset;
+                Ok(true)
+            }
+            Some(QueueOp::Depend(offset, dep_id, dep_offset)) => {
+                // `None` if dep_id is our write stream.
+                if let Some(dep) = self.streams.get_mut(&dep_id) {
+                    if dep_offset > dep.offset {
+                        tracing::info!("{} depends on {} {}", id, dep_id, dep_offset);
+                        let stream = self.streams.get_mut(id).unwrap();
+                        stream
+                            .queue
+                            .push_front(QueueOp::Depend(offset, dep_id, dep_offset));
+                        return Ok(false);
+                    }
+                }
+                self.streams.get_mut(id).unwrap().offset = offset;
+                Ok(true)
+            }
+            Some(QueueOp::Change(offset, ops)) => {
+                let doc = self.docs.get_mut(&entry.doc).unwrap();
                 let change = Change {
                     actor_id: ActorId::from_bytes(id.as_bytes()),
                     seq: entry.seq,
-                    start_op: entry.ops,
+                    start_op: doc.ops,
                     time: 0,
                     message: None,
                     hash: None,
@@ -392,31 +414,16 @@ impl BlakeDb {
                     operations: ops,
                     extra_bytes: vec![],
                 };
-                tracing::debug!("{:?}", change);
                 entry.seq += 1;
-                entry.ops += change.operations.len() as u64;
-                entry.offset = ev.offset;
-                let doc = self.docs.get_mut(&entry.doc).unwrap();
+                doc.ops += change.operations.len() as u64;
+                entry.offset = offset;
+                tracing::info!("applying change {} {}", id, offset);
                 let patch = doc.backend.apply_changes(vec![change.into()])?;
                 doc.tx.try_send(patch)?;
+                Ok(true)
             }
-        };
-        while let Some(id) = entry.dependents.pop_front() {
-            tracing::info!("popping dependent {}", id);
-            let rdep = self.streams.get_mut(&id).unwrap();
-            if let Some(event) = rdep.queue.pop_front() {
-                if event.offset < entry.offset {
-                    tracing::error!("blocked by {} < {}", event.offset, entry.offset);
-                    entry.dependents.push_front(id);
-                    rdep.queue.push_front(event);
-                    break;
-                }
-                tracing::info!("reapplying event {} {}", id, event.offset);
-                self.apply_event(&id, event, true)?;
-            }
+            None => Ok(false),
         }
-        self.streams.insert(*id, entry);
-        Ok(())
     }
 }
 
@@ -495,6 +502,7 @@ mod tests {
                 Value::from_json(&json!({ "cards": [] })),
             ))
         })?;
+
         doc1.next().await?;
         doc2.next().await?;
 

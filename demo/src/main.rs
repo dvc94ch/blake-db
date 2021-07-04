@@ -40,7 +40,7 @@ pub async fn main() -> Result<()> {
         }
     } else {
         let bootstrap = vec![(gen_keypair(0).to_public().into_peer_id(), addr)];
-        let mut db = Db::new(path, keypair, &bootstrap).await?;
+        let mut db = Db::new(path, keypair, &bootstrap, 0, i == 1).await?;
         let peer = if i == 1 { 2 } else { 1 };
         let id = StreamId::new(gen_keypair(peer).public.to_bytes(), 0);
         db.link(&id)?;

@@ -32,14 +32,16 @@ impl Db {
         path: PathBuf,
         keypair: Keypair,
         bootstrap: &[(PeerId, Multiaddr)],
+        doc: u64,
+        init: bool,
     ) -> Result<Self> {
         let config = Config::new(&path, keypair);
         let ipfs = Ipfs::new(config).await?;
         ipfs.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?.next().await;
         ipfs.bootstrap(bootstrap).await?;
         let mut db = BlakeDb::new(ipfs);
-        let mut doc = db.document(0).await?;
-        if doc.state().get_value(Path::root().key("todos")).is_none() {
+        let mut doc = db.document(doc).await?;
+        if init && doc.state().get_value(Path::root().key("todos")).is_none() {
             doc.change(|doc| {
                 doc.add_change(LocalChange::set(
                     Path::root(),
