@@ -12,8 +12,8 @@ anyhow = "1.0.41"
 async-channel = "1.6.1"
 automerge = { path = "../automerge-rs/automerge" }
 automerge-protocol = { path = "../automerge-rs/automerge-protocol" }
-blake-streams = { path = "../streams" }
-blake-streams-core = { path = "../streams/core", features = ["serde-derive"] }
+blake-streams = { path = "../blake-streams" }
+blake-streams-core = { path = "../blake-streams/core", features = ["serde-derive"] }
 byteorder = "1.4.3"
 fnv = "1.0.7"
 futures = "0.3.15"
@@ -30,3 +30,6 @@ ipfs-embed = { path = "../ipfs-embed" }
 serde_json = "1.0.64"
 tempdir = "0.3.7"
 tracing-subscriber = "0.2.19"
+
+[patch.crates-io]
+ipfs-embed = { path = "../ipfs-embed" }

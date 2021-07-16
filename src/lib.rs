@@ -404,7 +404,7 @@ impl BlakeDb {
             Some(QueueOp::Change(offset, ops)) => {
                 let doc = self.docs.get_mut(&entry.doc).unwrap();
                 let change = Change {
-                    actor_id: ActorId::from_bytes(id.as_bytes()),
+                    actor_id: ActorId::from(id.as_bytes()),
                     seq: entry.seq,
                     start_op: doc.ops,
                     time: 0,

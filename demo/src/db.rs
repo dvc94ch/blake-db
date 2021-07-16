@@ -67,7 +67,7 @@ impl Db {
         let mut todos = vec![];
         let path = Path::root().key("todos");
         let seq = self.doc.state().get_value(path);
-        let seq = if let Some(Cow::Borrowed(Value::Sequence(seq))) = seq {
+        let seq = if let Some(Cow::Borrowed(Value::List(seq))) = seq {
             seq
         } else {
             return todos;
