@@ -15,13 +15,13 @@ use zerocopy::AsBytes;
 
 pub use automerge::{LocalChange, Path, Primitive, Value};
 pub use automerge_protocol::Patch;
-pub use blake_streams::{ipfs_embed, Ipfs, StreamId};
+pub use blake_streams::{ipfs_embed, DocId, Ipfs, PeerId, StreamId};
 
 /// A blake stream contains stream ops.
 #[derive(Debug, Deserialize, Serialize)]
 enum StreamOp {
     /// Links a stream to another stream.
-    Link(StreamId),
+    Link(PeerId),
     /// A causal dependency identified by the
     /// local stream index and offset.
     Depend(u64, u64),
@@ -52,17 +52,15 @@ impl StreamOp {
 #[derive(Debug)]
 enum QueueOp {
     Link(u64),
-    Depend(u64, StreamId, u64),
+    Depend(u64, PeerId, u64),
     Change(u64, Vec<Op>),
 }
 
 /// State of a stream.
 #[derive(Debug)]
 struct StreamState {
-    /// Document id.
-    doc: u64,
-    /// The list of streams this stream has linked to.
-    streams: Vec<StreamId>,
+    /// The list of peers this stream has linked to.
+    peers: Vec<PeerId>,
     /// The next sequence number.
     seq: u64,
     /// The offset that was synced.
@@ -72,14 +70,13 @@ struct StreamState {
     /// Queue of unprocessed events.
     queue: VecDeque<QueueOp>,
     /// Queue of streams blocked by this stream.
-    dependents: VecDeque<StreamId>,
+    dependents: VecDeque<PeerId>,
 }
 
 impl StreamState {
-    fn new(doc: u64) -> Self {
+    fn new() -> Self {
         Self {
-            doc,
-            streams: Default::default(),
+            peers: Default::default(),
             seq: 1,
             sync_offset: 0,
             offset: 0,
@@ -94,9 +91,9 @@ impl StreamState {
 #[derive(Debug)]
 enum DocOp {
     /// Make a change to the document.
-    Change(u64, Change),
+    Change(DocId, Change),
     /// Link to another stream.
-    Link(u64, StreamId),
+    Link(DocId, PeerId),
 }
 
 /// State of a document.
@@ -108,7 +105,7 @@ struct DocumentState {
     /// Document backend.
     backend: Backend,
     /// Streams that are linked to this document.
-    streams: FnvHashMap<StreamId, u64>,
+    peers: FnvHashMap<PeerId, u64>,
     /// The next op number.
     ops: u64,
 }
@@ -119,7 +116,7 @@ impl DocumentState {
             tx,
             write: BufWriter::new(write),
             backend: Backend::new(),
-            streams: Default::default(),
+            peers: Default::default(),
             ops: 1,
         }
     }
@@ -148,7 +145,10 @@ impl Document {
     fn new(id: StreamId, tx: Sender<DocOp>, rx: Receiver<Patch>) -> Self {
         Self {
             id,
-            frontend: Frontend::new_with_timestamper_and_actor_id(Box::new(|| None), id.as_bytes()),
+            frontend: Frontend::new_with_timestamper_and_actor_id(
+                Box::new(|| None),
+                id.peer().as_bytes(),
+            ),
             tx,
             rx,
         }
@@ -158,8 +158,8 @@ impl Document {
         &self.id
     }
 
-    pub fn link(&mut self, id: &StreamId) -> Result<()> {
-        self.tx.try_send(DocOp::Link(self.id.stream(), *id))?;
+    pub fn link(&mut self, peer: &PeerId) -> Result<()> {
+        self.tx.try_send(DocOp::Link(self.id.doc(), *peer))?;
         Ok(())
     }
 
@@ -169,7 +169,7 @@ impl Document {
     {
         let (output, change) = self.frontend.change(None, cb)?;
         if let Some(change) = change {
-            self.tx.try_send(DocOp::Change(self.id.stream(), change))?;
+            self.tx.try_send(DocOp::Change(self.id.doc(), change))?;
         }
         Ok(output)
     }
@@ -183,7 +183,7 @@ impl Document {
     }
 
     pub fn apply_patch(&mut self, patch: Patch) -> Result<()> {
-        tracing::info!("applying patch");
+        tracing::info!("{}: apply_patch (peer {})", self.id.doc(), self.id.peer());
         self.frontend.apply_patch(patch)?;
         Ok(())
     }
@@ -199,7 +199,7 @@ impl Document {
 pub struct BlakeDb {
     inner: BlakeStreams,
     streams: FnvHashMap<StreamId, StreamState>,
-    docs: FnvHashMap<u64, DocumentState>,
+    docs: FnvHashMap<DocId, DocumentState>,
     heads: StreamsUnordered<Pin<Box<dyn Stream<Item = Head> + Send + 'static>>>,
     buf: Vec<u8>,
     tx: Sender<DocOp>,
@@ -225,7 +225,7 @@ impl BlakeDb {
         self.inner.ipfs()
     }
 
-    pub async fn document(&mut self, id: u64) -> Result<Document> {
+    pub async fn document(&mut self, id: DocId) -> Result<Document> {
         let mut write = self.inner.append(id).await?;
         let head = *write.head();
         if head.len() == 0 {
@@ -233,15 +233,15 @@ impl BlakeDb {
         }
         let (patch_tx, patch_rx) = async_channel::unbounded();
         let doc = DocumentState::new(patch_tx, write);
-        self.docs.insert(head.id().stream(), doc);
+        self.docs.insert(head.id().doc(), doc);
         if head.len() != 0 {
-            self.streams
-                .insert(*head.id(), StreamState::new(head.id().stream()));
-            self.apply_events(id, *head.id(), 0, head.len())?;
-            let links = self.streams.get(head.id()).unwrap().streams.clone();
-            for link in links {
-                if let Some(head) = self.inner.head(&link)? {
-                    self.apply_events(id, *head.id(), 0, head.len())?;
+            self.streams.insert(*head.id(), StreamState::new());
+            self.apply_events(*head.id(), 0, head.len())?;
+            let peers = self.streams.get(head.id()).unwrap().peers.clone();
+            for peer in peers {
+                let stream = StreamId::new(peer, id);
+                if let Some(head) = self.inner.head(&stream)? {
+                    self.apply_events(*head.id(), 0, head.len())?;
                 }
             }
             let stream = self.streams.remove(head.id()).unwrap();
@@ -249,37 +249,46 @@ impl BlakeDb {
         }
         let mut doc = Document::new(*head.id(), self.tx.clone(), patch_rx);
         while doc.next().now_or_never().is_some() {}
+        let subscription = self.inner.subscribe(id).await?;
+        self.heads.push(Box::pin(subscription));
         Ok(doc)
     }
 
-    async fn link(&mut self, id: u64, stream: &StreamId) -> Result<()> {
-        if stream.peer() == self.inner.ipfs().local_public_key() {
+    async fn link(&mut self, id: DocId, peer: PeerId) -> Result<()> {
+        if peer == self.inner.ipfs().local_public_key().into() {
             return Ok(());
         }
-        if self.streams.contains_key(stream) {
+        let stream_id = StreamId::new(peer, id);
+        if self.streams.contains_key(&stream_id) {
             return Ok(());
         }
-        tracing::info!("doc {}: linking {}", id, stream);
+        tracing::info!("{}: link (peer {})", id, peer);
         let doc = self.docs.get_mut(&id).unwrap();
-        let index = doc.streams.len() as u64;
-        doc.streams.insert(*stream, index);
-        self.streams.insert(*stream, StreamState::new(id));
-        StreamOp::Link(*stream).write_to(&mut doc.write)?;
+        let index = doc.peers.len() as u64;
+        doc.peers.insert(peer, index);
+        self.streams.insert(stream_id, StreamState::new());
+        self.inner.add_stream(&stream_id)?;
+        StreamOp::Link(peer).write_to(&mut doc.write)?;
         doc.commit().await?;
-        let subscription = self.inner.subscribe(stream).await?;
-        self.heads.push(Box::pin(subscription));
         Ok(())
     }
 
-    async fn change(&mut self, id: u64, change: Change) -> Result<()> {
-        tracing::debug!("doc: {} local_change: {:?}", id, change);
+    async fn change(&mut self, id: DocId, change: Change) -> Result<()> {
+        tracing::info!(
+            "{}: local_change (seq {}) (ops {})",
+            id,
+            change.seq,
+            change.operations.len()
+        );
+        tracing::trace!("{}: {:#?}", id, change);
         let ops = change.operations.clone();
         let doc = self.docs.get_mut(&id).unwrap();
         let (patch, _change) = doc.backend.apply_local_change(change)?;
         doc.tx.try_send(patch)?;
         let mut deps = vec![];
-        for (id, index) in &doc.streams {
-            if let Some(stream) = self.streams.get(id) {
+        for (peer, index) in &doc.peers {
+            let stream_id = StreamId::new(*peer, id);
+            if let Some(stream) = self.streams.get(&stream_id) {
                 // TODO only write changed offsets.
                 deps.push(StreamOp::Depend(*index, stream.offset));
             } else {
@@ -299,12 +308,12 @@ impl BlakeDb {
         futures::select! {
             head = self.heads.next().fuse() => {
                 if let Some(head) = head {
-                    self.new_head(head).await?;
+                    self.new_head(head)?;
                 }
             }
             cmd = self.rx.next().fuse() => {
                 match cmd {
-                    Some(DocOp::Link(id, stream)) => self.link(id, &stream).await?,
+                    Some(DocOp::Link(id, peer)) => self.link(id, peer).await?,
                     Some(DocOp::Change(id, change)) => self.change(id, change).await?,
                     None => {}
                 }
@@ -313,37 +322,44 @@ impl BlakeDb {
         Ok(())
     }
 
-    async fn new_head(&mut self, head: Head) -> Result<()> {
+    fn new_head(&mut self, head: Head) -> Result<()> {
         let id = head.id;
         let stream = self.streams.get(&id).unwrap();
-        let doc = stream.doc;
         let start = stream.sync_offset;
         let len = head.len - start;
-        tracing::info!("start {} len {} offset {}", start, len, head.len);
-        self.apply_events(doc, id, start, len)?;
+        tracing::info!(
+            "{}: new_head (peer {}) (start {}) (len {}) (offset {})",
+            id.doc(),
+            id.peer(),
+            start,
+            len,
+            head.len
+        );
+        self.apply_events(id, start, len)?;
         self.streams.get_mut(&id).unwrap().sync_offset = head.len;
         Ok(())
     }
 
-    fn apply_events(&mut self, doc: u64, id: StreamId, start: u64, len: u64) -> Result<()> {
+    fn apply_events(&mut self, id: StreamId, start: u64, len: u64) -> Result<()> {
         let mut reader = self.inner.slice(&id, start, len)?;
         let mut pos = 0;
         while pos < len {
             let op = StreamOp::read_one(&mut reader, &mut self.buf)?;
             pos += self.buf.len() as u64 + 8;
-            self.apply_op(doc, id, op, start + pos)?;
+            self.apply_op(id, op, start + pos)?;
         }
         Ok(())
     }
 
-    fn apply_op(&mut self, doc: u64, id: StreamId, op: StreamOp, offset: u64) -> Result<()> {
+    fn apply_op(&mut self, id: StreamId, op: StreamOp, offset: u64) -> Result<()> {
         self.queue_op(&id, op, offset);
-        let streams = self.docs.get(&doc).unwrap().streams.clone();
+        let peers = self.docs.get(&id.doc()).unwrap().peers.clone();
         let mut progress = true;
         while progress {
             progress = false;
-            for (id, _) in &streams {
-                while self.dequeue_op(id)? {
+            for (peer, _) in &peers {
+                let id = StreamId::new(*peer, id.doc());
+                while self.dequeue_op(&id)? {
                     progress = true;
                 }
             }
@@ -358,20 +374,21 @@ impl BlakeDb {
         let entry = self.streams.get_mut(&id).unwrap();
         match op {
             StreamOp::Link(dep) => {
-                entry.streams.push(dep);
+                entry.peers.push(dep);
                 tracing::info!(
-                    "linking {} to {} with index {}",
-                    id,
+                    "{}: linking (peer {}) (peer {}) (index {})",
+                    id.doc(),
+                    id.peer(),
                     dep,
-                    entry.streams.len()
+                    entry.peers.len()
                 );
                 entry.queue.push_back(QueueOp::Link(offset));
             }
-            StreamOp::Depend(dep_idx, dep_offset) => {
-                let dep_id = *entry.streams.get(dep_idx as usize).unwrap();
+            StreamOp::Depend(idx, stream_offset) => {
+                let peer_id = *entry.peers.get(idx as usize).unwrap();
                 entry
                     .queue
-                    .push_back(QueueOp::Depend(offset, dep_id, dep_offset));
+                    .push_back(QueueOp::Depend(offset, peer_id, stream_offset));
             }
             StreamOp::Change(ops) => {
                 entry.queue.push_back(QueueOp::Change(offset, ops));
@@ -386,15 +403,16 @@ impl BlakeDb {
                 entry.offset = offset;
                 Ok(true)
             }
-            Some(QueueOp::Depend(offset, dep_id, dep_offset)) => {
+            Some(QueueOp::Depend(offset, peer_id, stream_offset)) => {
+                let stream_id = StreamId::new(peer_id, id.doc());
                 // `None` if dep_id is our write stream.
-                if let Some(dep) = self.streams.get_mut(&dep_id) {
-                    if dep_offset > dep.offset {
-                        tracing::info!("{} depends on {} {}", id, dep_id, dep_offset);
+                if let Some(stream) = self.streams.get_mut(&stream_id) {
+                    if stream_offset > stream.offset {
+                        tracing::debug!("{} depends on {} {}", id, peer_id, stream_offset);
                         let stream = self.streams.get_mut(id).unwrap();
                         stream
                             .queue
-                            .push_front(QueueOp::Depend(offset, dep_id, dep_offset));
+                            .push_front(QueueOp::Depend(offset, peer_id, stream_offset));
                         return Ok(false);
                     }
                 }
@@ -402,9 +420,9 @@ impl BlakeDb {
                 Ok(true)
             }
             Some(QueueOp::Change(offset, ops)) => {
-                let doc = self.docs.get_mut(&entry.doc).unwrap();
+                let doc = self.docs.get_mut(&id.doc()).unwrap();
                 let change = Change {
-                    actor_id: ActorId::from(id.as_bytes()),
+                    actor_id: ActorId::from(id.peer().as_bytes()),
                     seq: entry.seq,
                     start_op: doc.ops,
                     time: 0,
@@ -417,7 +435,15 @@ impl BlakeDb {
                 entry.seq += 1;
                 doc.ops += change.operations.len() as u64;
                 entry.offset = offset;
-                tracing::info!("applying change {} {}", id, offset);
+                tracing::info!(
+                    "{}: apply_change (peer {}) (offset {}) (seq {}) (ops {})",
+                    id.doc(),
+                    id.peer(),
+                    offset,
+                    change.seq,
+                    change.operations.len()
+                );
+                tracing::trace!("{}: {:#?}", id.doc(), change);
                 let patch = doc.backend.apply_changes(vec![change.into()])?;
                 doc.tx.try_send(patch)?;
                 Ok(true)
@@ -469,8 +495,9 @@ mod tests {
         let mut db2 = create_swarm(tmp.path().join("b"), generate_keypair()).await?;
         db2.ipfs().bootstrap(&nodes).await?;
 
-        let mut doc1 = db1.document(0).await?;
-        let mut doc2 = db2.document(0).await?;
+        let doc_id = DocId::unique();
+        let mut doc1 = db1.document(doc_id).await?;
+        let mut doc2 = db2.document(doc_id).await?;
 
         let (exit_tx, mut exit_rx) = oneshot::channel();
         async_std::task::spawn(async move {
@@ -481,7 +508,9 @@ mod tests {
                         break;
                     }
                     next = db1.next().fuse() => {
-                        next.unwrap();
+                        if let Err(err) = next {
+                            tracing::error!("{}", err);
+                        }
                     }
                 }
             }
@@ -489,12 +518,14 @@ mod tests {
 
         async_std::task::spawn(async move {
             loop {
-                db2.next().await.unwrap();
+                if let Err(err) = db2.next().await {
+                    tracing::error!("{}", err);
+                }
             }
         });
 
-        doc1.link(&doc2.stream_id())?;
-        doc2.link(&doc1.stream_id())?;
+        doc1.link(&doc2.stream_id().peer())?;
+        doc2.link(&doc1.stream_id().peer())?;
 
         doc1.change(|doc| {
             doc.add_change(LocalChange::set(
@@ -502,9 +533,9 @@ mod tests {
                 Value::from_json(&json!({ "cards": [] })),
             ))
         })?;
-
         doc1.next().await?;
         doc2.next().await?;
+        assert_eq!(doc1.state(), doc2.state());
 
         doc1.change(|doc| {
             doc.add_change(LocalChange::insert(
@@ -516,6 +547,7 @@ mod tests {
         })?;
         doc1.next().await?;
         doc2.next().await?;
+        assert_eq!(doc1.state(), doc2.state());
 
         doc1.change(|doc| {
             doc.add_change(LocalChange::insert(
@@ -527,6 +559,7 @@ mod tests {
         })?;
         doc1.next().await?;
         doc2.next().await?;
+        assert_eq!(doc1.state(), doc2.state());
 
         doc1.change(|doc| {
             doc.add_change(LocalChange::set(
@@ -536,12 +569,13 @@ mod tests {
         })?;
         doc1.next().await?;
         doc2.next().await?;
+        assert_eq!(doc1.state(), doc2.state());
 
         doc2.change(|doc| doc.add_change(LocalChange::delete(Path::root().key("cards").index(1))))?;
         doc1.next().await?;
         doc2.next().await?;
-
         assert_eq!(doc1.state(), doc2.state());
+
         println!(
             "{}",
             serde_json::to_string(&doc1.state().to_json()).unwrap()
@@ -549,17 +583,19 @@ mod tests {
 
         exit_tx.send(()).unwrap();
 
-        let mut db1 = create_swarm(tmp.path().join("a"), key).await?;
+        /*let mut db1 = create_swarm(tmp.path().join("a"), key).await?;
         db1.ipfs().bootstrap(&nodes).await?;
-        let mut doc1 = db1.document(0).await?;
+        let mut doc1 = db1.document(doc_id).await?;
 
         async_std::task::spawn(async move {
             loop {
-                db1.next().await.unwrap();
+                if let Err(err) = db1.next().await {
+                    tracing::error!("{}", err);
+                }
             }
         });
 
-        assert_eq!(doc1.state(), doc2.state());
+        assert_eq!(doc1.state(), doc2.state());*/
 
         Ok(())
     }
