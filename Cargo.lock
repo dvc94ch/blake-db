@@ -357,6 +357,7 @@ checksum = "cdb031dd78e28731d87d56cc8ffef4a8f36ca26c38fe2de700543e627f8a464a"
 [[package]]
 name = "automerge"
 version = "0.0.2"
+source = "git+https://github.com/automerge/automerge-rs#3c786b26a8f14e80ab3238ca01f6c628d31abf5e"
 dependencies = [
  "automerge-backend",
  "automerge-frontend",
@@ -369,6 +370,7 @@ dependencies = [
 [[package]]
 name = "automerge-backend"
 version = "0.0.1"
+source = "git+https://github.com/automerge/automerge-rs#3c786b26a8f14e80ab3238ca01f6c628d31abf5e"
 dependencies = [
  "automerge-protocol",
  "flate2",
@@ -393,11 +395,12 @@ dependencies = [
 [[package]]
 name = "automerge-frontend"
 version = "0.1.0"
+source = "git+https://github.com/automerge/automerge-rs#3c786b26a8f14e80ab3238ca01f6c628d31abf5e"
 dependencies = [
  "automerge-protocol",
  "futures",
  "getrandom 0.2.3",
- "im",
+ "im-rc",
  "maplit",
  "serde",
  "serde_json",
@@ -410,6 +413,7 @@ dependencies = [
 [[package]]
 name = "automerge-protocol"
 version = "0.1.0"
+source = "git+https://github.com/automerge/automerge-rs#3c786b26a8f14e80ab3238ca01f6c628d31abf5e"
 dependencies = [
  "hex",
  "serde",
@@ -2266,6 +2270,20 @@ name = "im"
 version = "15.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "111c1983f3c5bb72732df25cddacee9b546d08325fb584b5ebd38148be7b0246"
+dependencies = [
+ "bitmaps",
+ "rand_core 0.5.1",
+ "rand_xoshiro",
+ "sized-chunks",
+ "typenum",
+ "version_check",
+]
+
+[[package]]
+name = "im-rc"
+version = "15.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca8957e71f04a205cb162508f9326aea04676c8dfd0711220190d6b83664f3f"
 dependencies = [
  "bitmaps",
  "rand_core 0.5.1",

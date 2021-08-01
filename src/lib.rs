@@ -127,6 +127,36 @@ impl DocumentState {
     }
 }
 
+#[derive(Debug)]
+pub struct SendableDocument {
+    /// Local stream id.
+    id: StreamId,
+    /// Send document operations to the backend.
+    tx: Sender<DocOp>,
+    /// Receive patches from the backend.
+    rx: Receiver<Patch>,
+}
+
+impl SendableDocument {
+    fn new(id: StreamId, tx: Sender<DocOp>, rx: Receiver<Patch>) -> Self {
+        Self { id, tx, rx }
+    }
+}
+
+impl From<SendableDocument> for Document {
+    fn from(doc: SendableDocument) -> Self {
+        Self {
+            id: doc.id,
+            tx: doc.tx,
+            rx: doc.rx,
+            frontend: Frontend::new_with_timestamper_and_actor_id(
+                Box::new(|| None),
+                doc.id.peer().as_bytes(),
+            ),
+        }
+    }
+}
+
 /// Document handle.
 #[derive(Debug)]
 pub struct Document {
@@ -141,18 +171,6 @@ pub struct Document {
 }
 
 impl Document {
-    fn new(id: StreamId, tx: Sender<DocOp>, rx: Receiver<Patch>) -> Self {
-        Self {
-            id,
-            frontend: Frontend::new_with_timestamper_and_actor_id(
-                Box::new(|| None),
-                id.peer().as_bytes(),
-            ),
-            tx,
-            rx,
-        }
-    }
-
     pub fn stream_id(&self) -> &StreamId {
         &self.id
     }
@@ -228,7 +246,7 @@ impl BlakeDb {
         self.inner.docs()
     }
 
-    pub async fn document(&mut self, id: DocId) -> Result<Document> {
+    pub async fn document(&mut self, id: DocId) -> Result<SendableDocument> {
         let doc = self.inner.subscribe(id).await?;
         let mut stream = doc.append()?;
         let head = *stream.head();
@@ -251,9 +269,7 @@ impl BlakeDb {
         let (patch_tx, patch_rx) = async_channel::unbounded();
         let doc = DocumentState::new(patch_tx, stream);
         self.docs.insert(head.id().doc(), doc);
-        let mut doc = Document::new(*head.id(), self.tx.clone(), patch_rx);
-        while doc.next().now_or_never().is_some() {}
-        Ok(doc)
+        Ok(SendableDocument::new(*head.id(), self.tx.clone(), patch_rx))
     }
 
     fn link(&mut self, id: DocId, peer: PeerId) -> Result<()> {
@@ -491,8 +507,8 @@ mod tests {
         let mut db2 = create_swarm(tmp.path().join("b"), generate_keypair()).await?;
 
         let doc_id = DocId::unique();
-        let mut doc1 = db1.document(doc_id).await?;
-        let mut doc2 = db2.document(doc_id).await?;
+        let mut doc1: Document = db1.document(doc_id).await?.into();
+        let mut doc2: Document = db2.document(doc_id).await?.into();
 
         let (exit_tx, mut exit_rx) = oneshot::channel();
         async_std::task::spawn(async move {

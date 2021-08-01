@@ -1,6 +1,6 @@
 use anyhow::Result;
 use blake_db::ipfs_embed::{Config, Keypair};
-use blake_db::{BlakeDb, DocId, Ipfs, LocalChange, Patch, Path, PeerId, Primitive, Value};
+use blake_db::{BlakeDb, DocId, Ipfs, LocalChange, Patch, Path, PeerId, Primitive, SendableDocument, Value};
 use futures::channel::{mpsc, oneshot};
 use futures::prelude::*;
 use futures::stream::BoxStream;
@@ -26,7 +26,7 @@ impl Todo {
 #[derive(Debug)]
 pub struct Db {
     docs: Vec<DocId>,
-    tx: mpsc::UnboundedSender<(DocId, oneshot::Sender<Result<blake_db::Document>>)>,
+    tx: mpsc::UnboundedSender<(DocId, oneshot::Sender<Result<SendableDocument>>)>,
 }
 
 impl Db {
@@ -36,7 +36,7 @@ impl Db {
         ipfs.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?.next().await;
         let mut db = BlakeDb::new(ipfs);
         let docs = db.docs()?;
-        let (tx, mut rx) = mpsc::unbounded::<(_, oneshot::Sender<Result<blake_db::Document>>)>();
+        let (tx, mut rx) = mpsc::unbounded::<(_, oneshot::Sender<Result<SendableDocument>>)>();
         async_std::task::spawn(async move {
             loop {
                 futures::select! {
@@ -71,20 +71,14 @@ impl Db {
     pub async fn open(&self, id: DocId) -> Result<Document> {
         let (tx, rx) = oneshot::channel();
         self.tx.unbounded_send((id, tx))?;
-        let doc = rx.await??;
-        Ok(Document { doc })
+        Ok(Document::new(rx.await??))
     }
 
     pub async fn create(&mut self) -> Result<Document> {
         let id = DocId::unique();
         let mut doc = self.open(id).await?;
-        doc.doc.change(|doc| {
-            doc.add_change(LocalChange::set(
-                Path::root(),
-                Value::from_json(&json!({ "todos": [] })),
-            ))
-        })?;
         self.docs.push(id);
+        doc.initialize()?;
         Ok(doc)
     }
 }
@@ -95,6 +89,19 @@ pub struct Document {
 }
 
 impl Document {
+    pub fn new(doc: SendableDocument) -> Self {
+        Self { doc: doc.into() }
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        self.doc.change(|doc| {
+            doc.add_change(LocalChange::set(
+                Path::root(),
+                Value::from_json(&json!({ "todos": [] })),
+            ))
+        })
+    }
+
     pub fn todos(&mut self) -> Vec<Todo> {
         let mut todos = vec![];
         let path = Path::root().key("todos");
