@@ -2,14 +2,13 @@ use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use automerge::{Backend, Frontend, InvalidChangeRequest, MutableDocument};
 use automerge_protocol::{ActorId, Change, Op};
-use blake_streams::{BlakeStreams, Head, StreamWriter};
+use blake_streams::{BlakeStreams, DocStream, DocWriter, Head};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use fnv::FnvHashMap;
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufWriter, Read, Write};
-use std::pin::Pin;
 use unicycle::StreamsUnordered;
 use zerocopy::AsBytes;
 
@@ -101,7 +100,7 @@ struct DocumentState {
     /// Send patches to the frontend.
     tx: Sender<Patch>,
     /// Stream writer to write stream ops to.
-    write: BufWriter<StreamWriter>,
+    write: BufWriter<DocWriter>,
     /// Document backend.
     backend: Backend,
     /// Streams that are linked to this document.
@@ -111,7 +110,7 @@ struct DocumentState {
 }
 
 impl DocumentState {
-    pub fn new(tx: Sender<Patch>, write: StreamWriter) -> Self {
+    pub fn new(tx: Sender<Patch>, write: DocWriter) -> Self {
         Self {
             tx,
             write: BufWriter::new(write),
@@ -121,9 +120,9 @@ impl DocumentState {
         }
     }
 
-    pub async fn commit(&mut self) -> Result<()> {
+    pub fn commit(&mut self) -> Result<()> {
         self.write.flush()?;
-        self.write.get_mut().commit().await?;
+        self.write.get_mut().commit()?;
         Ok(())
     }
 }
@@ -200,7 +199,7 @@ pub struct BlakeDb {
     inner: BlakeStreams,
     streams: FnvHashMap<StreamId, StreamState>,
     docs: FnvHashMap<DocId, DocumentState>,
-    heads: StreamsUnordered<Pin<Box<dyn Stream<Item = Head> + Send + 'static>>>,
+    heads: StreamsUnordered<DocStream>,
     buf: Vec<u8>,
     tx: Sender<DocOp>,
     /// Receive commands from the frontends.
@@ -226,35 +225,34 @@ impl BlakeDb {
     }
 
     pub async fn document(&mut self, id: DocId) -> Result<Document> {
-        let mut write = self.inner.append(id).await?;
-        let head = *write.head();
+        let doc = self.inner.subscribe(id).await?;
+        let mut stream = doc.append()?;
+        let head = *stream.head();
         if head.len() == 0 {
-            write.commit().await?;
+            stream.commit()?;
         }
-        let (patch_tx, patch_rx) = async_channel::unbounded();
-        let doc = DocumentState::new(patch_tx, write);
-        self.docs.insert(head.id().doc(), doc);
-        if head.len() != 0 {
-            self.streams.insert(*head.id(), StreamState::new());
-            self.apply_events(*head.id(), 0, head.len())?;
-            let peers = self.streams.get(head.id()).unwrap().peers.clone();
-            for peer in peers {
-                let stream = StreamId::new(peer, id);
-                if let Some(head) = self.inner.head(&stream)? {
-                    self.apply_events(*head.id(), 0, head.len())?;
-                }
+        /*let streams = self.inner.streams(id)?;
+        tracing::info!("streams {:?}", streams);
+        for stream in &streams {
+            self.streams.insert(*stream, StreamState::new());
+            tracing::info!("adding stream {}", stream);
+        }
+        for stream in &streams {
+            if let Some(head) = self.inner.head(stream)? {
+                tracing::info!("replaying stream {}", stream);
+                self.new_head(*head.head())?;
             }
-            let stream = self.streams.remove(head.id()).unwrap();
-            assert!(stream.queue.is_empty());
-        }
+        }*/
+        self.heads.push(doc);
+        let (patch_tx, patch_rx) = async_channel::unbounded();
+        let doc = DocumentState::new(patch_tx, stream);
+        self.docs.insert(head.id().doc(), doc);
         let mut doc = Document::new(*head.id(), self.tx.clone(), patch_rx);
         while doc.next().now_or_never().is_some() {}
-        let subscription = self.inner.subscribe(id).await?;
-        self.heads.push(Box::pin(subscription));
         Ok(doc)
     }
 
-    async fn link(&mut self, id: DocId, peer: PeerId) -> Result<()> {
+    fn link(&mut self, id: DocId, peer: PeerId) -> Result<()> {
         if peer == self.inner.ipfs().local_public_key().into() {
             return Ok(());
         }
@@ -267,13 +265,13 @@ impl BlakeDb {
         let index = doc.peers.len() as u64;
         doc.peers.insert(peer, index);
         self.streams.insert(stream_id, StreamState::new());
-        self.inner.add_stream(&stream_id)?;
+        self.inner.link_stream(&stream_id)?;
         StreamOp::Link(peer).write_to(&mut doc.write)?;
-        doc.commit().await?;
+        doc.commit()?;
         Ok(())
     }
 
-    async fn change(&mut self, id: DocId, change: Change) -> Result<()> {
+    fn change(&mut self, id: DocId, change: Change) -> Result<()> {
         tracing::info!(
             "{}: local_change (seq {}) (ops {})",
             id,
@@ -300,7 +298,7 @@ impl BlakeDb {
         }
         doc.ops += ops.len() as u64;
         StreamOp::Change(ops).write_to(&mut doc.write)?;
-        doc.commit().await?;
+        doc.commit()?;
         Ok(())
     }
 
@@ -313,8 +311,8 @@ impl BlakeDb {
             }
             cmd = self.rx.next().fuse() => {
                 match cmd {
-                    Some(DocOp::Link(id, peer)) => self.link(id, peer).await?,
-                    Some(DocOp::Change(id, change)) => self.change(id, change).await?,
+                    Some(DocOp::Link(id, peer)) => self.link(id, peer)?,
+                    Some(DocOp::Change(id, change)) => self.change(id, change)?,
                     None => {}
                 }
             }
@@ -483,17 +481,10 @@ mod tests {
         tracing_try_init();
         let tmp = TempDir::new("test_cards")?;
 
-        let bootstrap = create_swarm(tmp.path().join("bootstrap"), generate_keypair()).await?;
-        let addr = bootstrap.ipfs().listeners()[0].clone();
-        let peer_id = bootstrap.ipfs().local_peer_id();
-        let nodes = [(peer_id, addr)];
-
         let key = generate_keypair();
         let key2 = Keypair::from_bytes(&key.to_bytes()).unwrap();
         let mut db1 = create_swarm(tmp.path().join("a"), key2).await?;
-        db1.ipfs().bootstrap(&nodes).await?;
         let mut db2 = create_swarm(tmp.path().join("b"), generate_keypair()).await?;
-        db2.ipfs().bootstrap(&nodes).await?;
 
         let doc_id = DocId::unique();
         let mut doc1 = db1.document(doc_id).await?;
@@ -505,6 +496,7 @@ mod tests {
             loop {
                 futures::select! {
                     _ = exit.fuse() => {
+                        tracing::info!("exiting blakedb task");
                         break;
                     }
                     next = db1.next().fuse() => {
@@ -584,7 +576,6 @@ mod tests {
         exit_tx.send(()).unwrap();
 
         /*let mut db1 = create_swarm(tmp.path().join("a"), key).await?;
-        db1.ipfs().bootstrap(&nodes).await?;
         let mut doc1 = db1.document(doc_id).await?;
 
         async_std::task::spawn(async move {

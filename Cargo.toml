@@ -10,13 +10,14 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0.41"
 async-channel = "1.6.1"
-automerge = { path = "../automerge-rs/automerge" }
-automerge-protocol = { path = "../automerge-rs/automerge-protocol" }
-blake-streams = { path = "../blake-streams" }
-blake-streams-core = { path = "../blake-streams/core", features = ["serde-derive"] }
+automerge = { git = "https://github.com/automerge/automerge-rs" }
+automerge-protocol = { git = "https://github.com/automerge/automerge-rs" }
+blake-streams = "0.1.0"
+blake-streams-core = { features = ["serde-derive"], version = "0.1.1" }
 byteorder = "1.4.3"
 fnv = "1.0.7"
 futures = "0.3.15"
+ipfs-embed = "0.22.3"
 serde = "1.0.126"
 serde_cbor = "0.11.1"
 sled = "0.34.6"
@@ -26,10 +27,12 @@ zerocopy = "0.5.0"
 
 [dev-dependencies]
 async-std = { version = "1.9.0", features = ["attributes"] }
-ipfs-embed = { path = "../ipfs-embed" }
 serde_json = "1.0.64"
 tempdir = "0.3.7"
 tracing-subscriber = "0.2.19"
 
 [patch.crates-io]
-ipfs-embed = { path = "../ipfs-embed" }
+blake-streams = { path = "../blake-streams" }
+blake-streams-core = { path = "../blake-streams/core" }
+libp2p-blake-streams = { path = "../blake-streams/libp2p" }
+sled = { git = "https://github.com/spacejam/sled" }
