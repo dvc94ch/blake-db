@@ -10,8 +10,8 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0.41"
 async-channel = "1.6.1"
-automerge = { git = "https://github.com/automerge/automerge-rs" }
-automerge-protocol = { git = "https://github.com/automerge/automerge-rs" }
+automerge = { path = "../automerge-rs/automerge" }
+automerge-protocol = { path = "../automerge-rs/automerge-protocol" }
 blake-streams = "0.1.0"
 blake-streams-core = { features = ["serde-derive"], version = "0.1.1" }
 byteorder = "1.4.3"

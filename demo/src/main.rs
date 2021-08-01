@@ -1,14 +1,13 @@
 use anyhow::Result;
 use blake_db::{
-    ipfs_embed::{Config, Keypair, PublicKey, SecretKey, ToLibp2p},
-    Ipfs, Patch, StreamId,
+    ipfs_embed::{Keypair, PublicKey, SecretKey},
+    Patch,
 };
 use blake_db_demo::{
-    db::Db,
+    db::{Db, Document},
     style,
     task::{Task, TaskMessage},
 };
-use futures::prelude::*;
 use iced::{
     button, scrollable, text_input, Align, Application, Button, Clipboard, Column, Command,
     Container, Element, HorizontalAlignment, Length, Row, Scrollable, Settings, Subscription, Text,
@@ -30,22 +29,9 @@ pub async fn main() -> Result<()> {
     let i: u8 = std::env::args().nth(1).unwrap().parse()?;
     let path = Path::new("/tmp").join(i.to_string());
     let keypair = gen_keypair(i);
-    let addr = "/ip4/0.0.0.0/tcp/8001".parse()?;
-    if i == 0 {
-        let config = Config::new(&path, keypair);
-        let ipfs = Ipfs::new(config).await?;
-        ipfs.listen_on(addr)?.next().await;
-        loop {
-            async_std::task::sleep(std::time::Duration::from_secs(1)).await
-        }
-    } else {
-        let bootstrap = vec![(gen_keypair(0).to_public().into_peer_id(), addr)];
-        let mut db = Db::new(path, keypair, &bootstrap, 0, i == 1).await?;
-        let peer = if i == 1 { 2 } else { 1 };
-        let id = StreamId::new(gen_keypair(peer).public.to_bytes(), 0);
-        db.link(&id)?;
-        Todos::run(Settings::with_flags(db))?;
-    }
+    let mut db = Db::new(path, keypair).await?;
+    let doc = db.open_first_or_create().await?;
+    Todos::run(Settings::with_flags((db, doc)))?;
     Ok(())
 }
 
@@ -58,18 +44,20 @@ struct Todos {
     tasks: Vec<Task>,
     controls: Controls,
     db: Db,
+    doc: Document,
 }
 
 impl Todos {
-    fn new(mut db: Db) -> Self {
+    fn new((db, mut doc): (Db, Document)) -> Self {
         Self {
             scroll: Default::default(),
             input: Default::default(),
             input_value: Default::default(),
             filter: Default::default(),
             controls: Default::default(),
-            tasks: db.todos().into_iter().map(From::from).collect(),
+            tasks: doc.todos().into_iter().map(From::from).collect(),
             db,
+            doc,
         }
     }
 }
@@ -86,9 +74,9 @@ enum Message {
 impl Application for Todos {
     type Executor = iced::executor::Default;
     type Message = Message;
-    type Flags = Db;
+    type Flags = (Db, Document);
 
-    fn new(flags: Db) -> (Todos, Command<Message>) {
+    fn new(flags: Self::Flags) -> (Todos, Command<Message>) {
         (Self::new(flags), Command::none())
     }
 
@@ -104,7 +92,7 @@ impl Application for Todos {
             Message::CreateTask => {
                 if !self.input_value.is_empty() {
                     let title = self.input_value.clone();
-                    if let Err(err) = self.db.add_todo(&title) {
+                    if let Err(err) = self.doc.add_todo(&title) {
                         tracing::error!("err: {}", err);
                     } else {
                         self.input_value.clear();
@@ -116,7 +104,7 @@ impl Application for Todos {
                 self.filter = filter;
             }
             Message::TaskMessage(i, TaskMessage::SetDone(done)) => {
-                if let Err(err) = self.db.set_done(i as u32, done) {
+                if let Err(err) = self.doc.set_done(i as u32, done) {
                     tracing::error!("err: {}", err);
                 } else {
                     if let Some(task) = self.tasks.get_mut(i) {
@@ -125,7 +113,7 @@ impl Application for Todos {
                 }
             }
             Message::TaskMessage(i, TaskMessage::SetTitle(title)) => {
-                if let Err(err) = self.db.set_title(i as u32, &title) {
+                if let Err(err) = self.doc.set_title(i as u32, &title) {
                     tracing::error!("err: {}", err);
                 } else {
                     if let Some(task) = self.tasks.get_mut(i) {
@@ -134,7 +122,7 @@ impl Application for Todos {
                 }
             }
             Message::TaskMessage(i, TaskMessage::Delete) => {
-                if let Err(err) = self.db.delete_todo(i as u32) {
+                if let Err(err) = self.doc.delete_todo(i as u32) {
                     tracing::error!("err: {}", err);
                 } else {
                     self.tasks.remove(i);
@@ -146,10 +134,10 @@ impl Application for Todos {
                 }
             }
             Message::ApplyPatch(patch) => {
-                if let Err(err) = self.db.apply_patch(patch) {
+                if let Err(err) = self.doc.apply_patch(patch) {
                     tracing::error!("err: {}", err);
                 } else {
-                    let todos = self.db.todos();
+                    let todos = self.doc.todos();
                     self.tasks.truncate(todos.len());
                     for (i, todo) in todos.into_iter().enumerate() {
                         if let Some(task) = self.tasks.get_mut(i) {
@@ -165,7 +153,7 @@ impl Application for Todos {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        self.db.subscription().map(Message::ApplyPatch)
+        self.doc.subscription().map(Message::ApplyPatch)
     }
 
     fn view(&mut self) -> Element<Message> {

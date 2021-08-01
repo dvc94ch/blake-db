@@ -224,6 +224,10 @@ impl BlakeDb {
         self.inner.ipfs()
     }
 
+    pub fn docs(&self) -> Result<Vec<DocId>> {
+        self.inner.docs()
+    }
+
     pub async fn document(&mut self, id: DocId) -> Result<Document> {
         let doc = self.inner.subscribe(id).await?;
         let mut stream = doc.append()?;

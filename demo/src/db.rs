@@ -1,6 +1,7 @@
 use anyhow::Result;
-use blake_db::ipfs_embed::{Config, Keypair, Multiaddr, PeerId};
-use blake_db::{BlakeDb, Document, Ipfs, LocalChange, Patch, Path, Primitive, StreamId, Value};
+use blake_db::ipfs_embed::{Config, Keypair};
+use blake_db::{BlakeDb, DocId, Ipfs, LocalChange, Patch, Path, PeerId, Primitive, Value};
+use futures::channel::{mpsc, oneshot};
 use futures::prelude::*;
 use futures::stream::BoxStream;
 use iced::Subscription;
@@ -24,45 +25,76 @@ impl Todo {
 
 #[derive(Debug)]
 pub struct Db {
-    doc: Document,
+    docs: Vec<DocId>,
+    tx: mpsc::UnboundedSender<(DocId, oneshot::Sender<Result<blake_db::Document>>)>,
 }
 
 impl Db {
-    pub async fn new(
-        path: PathBuf,
-        keypair: Keypair,
-        bootstrap: &[(PeerId, Multiaddr)],
-        doc: u64,
-        init: bool,
-    ) -> Result<Self> {
+    pub async fn new(path: PathBuf, keypair: Keypair) -> Result<Self> {
         let config = Config::new(&path, keypair);
         let ipfs = Ipfs::new(config).await?;
         ipfs.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?.next().await;
-        ipfs.bootstrap(bootstrap).await?;
         let mut db = BlakeDb::new(ipfs);
-        let mut doc = db.document(doc).await?;
-        if init && doc.state().get_value(Path::root().key("todos")).is_none() {
-            doc.change(|doc| {
-                doc.add_change(LocalChange::set(
-                    Path::root(),
-                    Value::from_json(&json!({ "todos": [] })),
-                ))
-            })?;
-        }
+        let docs = db.docs()?;
+        let (tx, mut rx) = mpsc::unbounded::<(_, oneshot::Sender<Result<blake_db::Document>>)>();
         async_std::task::spawn(async move {
             loop {
-                if let Err(err) = db.next().await {
-                    tracing::error!("{}", err);
+                futures::select! {
+                    res = db.next().fuse() => match res {
+                        Err(err) => tracing::error!("{}", err),
+                        _ => {}
+                    },
+                    cmd = rx.next().fuse() => match cmd {
+                        Some((id, tx)) => {
+                            tx.send(db.document(id).await).ok();
+                        }
+                        None => return,
+                    }
                 }
             }
         });
-        Ok(Self { doc })
+        Ok(Self { docs, tx })
     }
 
-    pub fn stream_id(&self) -> &StreamId {
-        self.doc.stream_id()
+    pub fn docs(&self) -> &[DocId] {
+        &self.docs
     }
 
+    pub async fn open_first_or_create(&mut self) -> Result<Document> {
+        if let Some(id) = self.docs.get(0) {
+            self.open(*id).await
+        } else {
+            self.create().await
+        }
+    }
+
+    pub async fn open(&self, id: DocId) -> Result<Document> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.unbounded_send((id, tx))?;
+        let doc = rx.await??;
+        Ok(Document { doc })
+    }
+
+    pub async fn create(&mut self) -> Result<Document> {
+        let id = DocId::unique();
+        let mut doc = self.open(id).await?;
+        doc.doc.change(|doc| {
+            doc.add_change(LocalChange::set(
+                Path::root(),
+                Value::from_json(&json!({ "todos": [] })),
+            ))
+        })?;
+        self.docs.push(id);
+        Ok(doc)
+    }
+}
+
+#[derive(Debug)]
+pub struct Document {
+    doc: blake_db::Document,
+}
+
+impl Document {
     pub fn todos(&mut self) -> Vec<Todo> {
         let mut todos = vec![];
         let path = Path::root().key("todos");
@@ -92,7 +124,7 @@ impl Db {
         self.doc.apply_patch(patch)
     }
 
-    pub fn link(&mut self, id: &StreamId) -> Result<()> {
+    pub fn link(&mut self, id: &PeerId) -> Result<()> {
         self.doc.link(id)
     }
 
