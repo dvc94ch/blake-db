@@ -32,7 +32,7 @@ tempdir = "0.3.7"
 tracing-subscriber = "0.2.19"
 
 [patch.crates-io]
-blake-streams = { path = "../blake-streams" }
-blake-streams-core = { path = "../blake-streams/core" }
-libp2p-blake-streams = { path = "../blake-streams/libp2p" }
+blake-streams = { git = "https://github.com/ipfs-rust/blake-streams" }
+blake-streams-core = { git = "https://github.com/ipfs-rust/blake-streams" }
+libp2p-blake-streams = { git = "https://github.com/ipfs-rust/blake-streams" }
 sled = { git = "https://github.com/spacejam/sled" }
