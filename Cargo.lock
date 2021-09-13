@@ -529,6 +529,7 @@ dependencies = [
 [[package]]
 name = "blake-streams"
 version = "0.1.0"
+source = "git+https://github.com/ipfs-rust/blake-streams#f6fb61845bbbc3cf4491fefa78e9ab240189fc34"
 dependencies = [
  "anyhow",
  "async-global-executor",
@@ -542,6 +543,7 @@ dependencies = [
 [[package]]
 name = "blake-streams-core"
 version = "0.1.1"
+source = "git+https://github.com/ipfs-rust/blake-streams#f6fb61845bbbc3cf4491fefa78e9ab240189fc34"
 dependencies = [
  "anyhow",
  "bao",
@@ -2609,6 +2611,7 @@ dependencies = [
 [[package]]
 name = "libp2p-blake-streams"
 version = "0.1.1"
+source = "git+https://github.com/ipfs-rust/blake-streams#f6fb61845bbbc3cf4491fefa78e9ab240189fc34"
 dependencies = [
  "anyhow",
  "async-trait",
